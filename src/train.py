@@ -1,67 +1,21 @@
 import os.path
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
 from tqdm import tqdm
+import torch
+from torch.utils.data import DataLoader
+from common import Network, decode_target, decode
 import numpy as np
-from collections import OrderedDict
-from CaptchaDataset import CaptchaDataset, decode, decode_target, characters
+import torch.nn.functional as F
 
 
-class Network(nn.Module):
-    def __init__(self, n_classes, input_shape=(3, 64, 128)):
-        super(Network, self).__init__()
-        self.input_shape = input_shape
-        channels = [32, 64, 128, 256, 256]
-        layers = [2, 2, 2, 2, 2]
-        kernels = [3, 3, 3, 3, 3]
-        pools = [2, 2, 2, 2, (2, 1)]
-        modules = OrderedDict()
-
-        def cba(name, in_channels, out_channels, kernel_size):
-            modules[f'conv{name}'] = nn.Conv2d(in_channels, out_channels, kernel_size,
-                                               padding=(1, 1) if kernel_size == 3 else 0)
-            modules[f'bn{name}'] = nn.BatchNorm2d(out_channels)
-            modules[f'relu{name}'] = nn.ReLU(inplace=True)
-
-        last_channel = 3
-        for block, (n_channel, n_layer, n_kernel, k_pool) in enumerate(zip(channels, layers, kernels, pools)):
-            for layer in range(1, n_layer + 1):
-                cba(f'{block + 1}{layer}', last_channel, n_channel, n_kernel)
-                last_channel = n_channel
-            modules[f'pool{block + 1}'] = nn.MaxPool2d(k_pool)
-        modules[f'dropout'] = nn.Dropout(0.25, inplace=True)
-
-        self.cnn = nn.Sequential(modules)
-        self.lstm = nn.LSTM(input_size=self.infer_features(), hidden_size=128, num_layers=2, bidirectional=True)
-        self.fc = nn.Linear(in_features=256, out_features=n_classes)
-
-    def infer_features(self):
-        x = torch.zeros((1,) + self.input_shape)
-        x = self.cnn(x)
-        x = x.reshape(x.shape[0], -1, x.shape[-1])
-        return x.shape[1]
-
-    def forward(self, x):
-        x = self.cnn(x)
-        x = x.reshape(x.shape[0], -1, x.shape[-1])
-        x = x.permute(2, 0, 1)
-        x, _ = self.lstm(x)
-        x = self.fc(x)
-        return x
-
-
-def calc_acc(target, output):
+def calc_acc(target, output, classes):
     output_argmax = output.detach().permute(1, 0, 2).argmax(dim=-1)
     target = target.cpu().numpy()
     output_argmax = output_argmax.cpu().numpy()
-    a = np.array([decode_target(true) == decode(pred) for true, pred in zip(target, output_argmax)])
+    a = np.array([decode_target(true, classes) == decode(pred, classes) for true, pred in zip(target, output_argmax)])
     return a.mean()
 
 
-def train(model, optimizer, epochs, dataloader, device: torch.device):
+def train(model, optimizer, epochs, dataloader, device: torch.device, classes: list[str]):
     model.train()
     loss_mean = 0
     acc_mean = 0
@@ -79,7 +33,7 @@ def train(model, optimizer, epochs, dataloader, device: torch.device):
             optimizer.step()
 
             loss = loss.item()
-            acc = calc_acc(target, output)
+            acc = calc_acc(target, output, classes)
 
             if batch_index == 0:
                 loss_mean = loss
@@ -91,7 +45,7 @@ def train(model, optimizer, epochs, dataloader, device: torch.device):
             pbar.set_description(f'Epoch: {epochs} Loss: {loss_mean:.4f} Acc: {acc_mean:.4f} ')
 
 
-def valid(model, epochs, dataloader, device: torch.device):
+def valid(model, epochs, dataloader, device: torch.device, classes: list[str]):
     model.eval()
     with tqdm(dataloader) as pbar, torch.no_grad():
         loss_sum = 0
@@ -104,7 +58,7 @@ def valid(model, epochs, dataloader, device: torch.device):
             loss = F.ctc_loss(output_log_softmax, target, input_lengths, target_lengths)
 
             loss = loss.item()
-            acc = calc_acc(target, output)
+            acc = calc_acc(target, output, classes)
 
             loss_sum += loss
             acc_sum += acc
@@ -117,29 +71,31 @@ def valid(model, epochs, dataloader, device: torch.device):
 
 class ModelTrainer:
     def __init__(self,
-                 class_count: int,
+                 classes: list[str] | str,
                  input_shape: tuple[int, int, int],
                  device: torch.device,
                  train_dataloader: DataLoader,
                  valid_dataloader: DataLoader,
                  epochs: int = 30,
+                 checkpoint: str | None = None
                  ):
-        self.class_count = class_count
-        self.input_shape = input_shape
+        self.classes = classes
         self.device = device
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
         self.epochs = epochs
+        self.model = Network(class_count=len(classes), input_shape=input_shape)
+        if checkpoint:
+            self.model.load_state_dict(torch.load(checkpoint))
 
     def optimise(self, learning_rate: float, epochs: int):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate, amsgrad=True)
         for epoch in range(1, epochs + 1):
             train(model=self.model, optimizer=optimizer, epochs=epochs, dataloader=self.train_dataloader,
-                  device=self.device)
-            valid(self.model, epochs=epochs, dataloader=self.valid_dataloader, device=self.device)
+                  device=self.device, classes=self.classes)
+            valid(self.model, epochs=epochs, dataloader=self.valid_dataloader, device=self.device, classes=self.classes)
 
     def train(self):
-        self.model = Network(self.class_count, input_shape=self.input_shape)
         self.model.to(self.device)
 
         # Train and optimise model on provided no of epochs
@@ -148,29 +104,35 @@ class ModelTrainer:
 
     def save_model(self, path: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(self.model, path)
+        torch.save(self.model.state_dict(), path)
 
 
 if __name__ == '__main__':
+    import string
+    from datasets.GeneratedCaptchaDataset import GeneratedCaptchaDataset
+
+    characters = '-' + string.digits + string.ascii_uppercase
     width, height, n_len, n_classes = 192, 64, 4, len(characters)
     n_input_length = 12
-    dataset = CaptchaDataset(characters=characters, length=1, width=width, height=height, input_length=n_input_length,
-                             label_length=n_len)
+    dataset = GeneratedCaptchaDataset(characters=characters, length=1, width=width, height=height,
+                                      input_length=n_input_length,
+                                      label_length=n_len)
 
     batch_size = 128
-    train_set = CaptchaDataset(characters, 100 * batch_size, width, height, n_input_length, n_len)
-    valid_set = CaptchaDataset(characters, 50 * batch_size, width, height, n_input_length, n_len)
+    train_set = GeneratedCaptchaDataset(characters, 10 * batch_size, width, height, n_input_length, n_len)
+    valid_set = GeneratedCaptchaDataset(characters, 5 * batch_size, width, height, n_input_length, n_len)
     train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=os.cpu_count())
     valid_loader = DataLoader(valid_set, batch_size=batch_size, num_workers=os.cpu_count())
 
     # start model training
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     model = ModelTrainer(
-        class_count=len(characters),
-        input_shape=(3, 64, 192),
+        classes=characters,
+        input_shape=(192, 64, 3),
         device=device,
         train_dataloader=train_loader,
         valid_dataloader=valid_loader,
+        checkpoint=None,
         epochs=30
     )
     model.train()
