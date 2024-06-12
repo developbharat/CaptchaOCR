@@ -136,4 +136,6 @@ if __name__ == '__main__':
         epochs=30
     )
     model.train()
-    model.save_model("data/models/captcha.pt")
+
+    model_save_path = os.path.join(os.path.dirname(__file__), "..", 'data', 'models', "captcha.pt")
+    model.save_model(model_save_path)
