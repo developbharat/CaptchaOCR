@@ -15,10 +15,11 @@ def calc_acc(target, output, classes):
     return a.mean()
 
 
-def train(model, optimizer, epochs, dataloader, device: torch.device, classes: list[str]):
+def train(model, optimizer, epochs, epoch, dataloader, device: torch.device, classes: list[str]):
     model.train()
     loss_mean = 0
     acc_mean = 0
+
     with tqdm(dataloader) as pbar:
         for batch_index, (data, target, input_lengths, target_lengths) in enumerate(pbar):
             data, target = data.to(device), target.to(device)
@@ -42,10 +43,10 @@ def train(model, optimizer, epochs, dataloader, device: torch.device, classes: l
             loss_mean = 0.1 * loss + 0.9 * loss_mean
             acc_mean = 0.1 * acc + 0.9 * acc_mean
 
-            pbar.set_description(f'Epoch: {epochs} Loss: {loss_mean:.4f} Acc: {acc_mean:.4f} ')
+            pbar.set_description(f'Epoch: {epoch}/{epochs} Loss: {loss_mean:.4f} Acc: {acc_mean:.4f} ')
+    return loss_mean, acc_mean
 
-
-def valid(model, epochs, dataloader, device: torch.device, classes: list[str]):
+def valid(model, epochs, epoch, dataloader, device: torch.device, classes: list[str]):
     model.eval()
     with tqdm(dataloader) as pbar, torch.no_grad():
         loss_sum = 0
@@ -66,8 +67,8 @@ def valid(model, epochs, dataloader, device: torch.device, classes: list[str]):
             loss_mean = loss_sum / (batch_index + 1)
             acc_mean = acc_sum / (batch_index + 1)
 
-            pbar.set_description(f'Test : {epochs} Loss: {loss_mean:.4f} Acc: {acc_mean:.4f} ')
-
+            pbar.set_description(f'Test : {epoch}/{epochs} Loss: {loss_mean:.4f} Acc: {acc_mean:.4f} ')
+    return loss_mean, acc_mean
 
 class ModelTrainer:
     def __init__(self,
@@ -77,13 +78,17 @@ class ModelTrainer:
                  train_dataloader: DataLoader,
                  valid_dataloader: DataLoader,
                  epochs: int = 30,
-                 checkpoint: str | None = None
+                 checkpoint: str | None = None,
+                 checkpoints_dirpath: str = "./checkpoints",
                  ):
         self.classes = classes
         self.device = device
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
         self.epochs = epochs
+        self.best_acc = 0.0
+        self.best_model = ""
+        self.checkpoints_dirpath = checkpoints_dirpath
         self.model = Network(class_count=len(classes), input_shape=input_shape)
         if checkpoint:
             self.model.load_state_dict(torch.load(checkpoint))
@@ -91,9 +96,15 @@ class ModelTrainer:
     def optimise(self, learning_rate: float, epochs: int):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate, amsgrad=True)
         for epoch in range(1, epochs + 1):
-            train(model=self.model, optimizer=optimizer, epochs=epochs, dataloader=self.train_dataloader,
+            _, acc1 = train(model=self.model, optimizer=optimizer, epochs=epochs, epoch=epoch, dataloader=self.train_dataloader,
                   device=self.device, classes=self.classes)
-            valid(self.model, epochs=epochs, dataloader=self.valid_dataloader, device=self.device, classes=self.classes)
+            _, acc2 = valid(self.model, epochs=epochs, epoch=epoch, dataloader=self.valid_dataloader, device=self.device, classes=self.classes)
+
+            # store most accurate model to disk after each epoch
+            if self.best_acc < acc1 + acc2:
+                self.best_acc = acc1 + acc2
+                self.best_model = os.path.join(self.checkpoints_dirpath, f"epoch-{epoch:.4f}-acc-{self.best_acc:.4f}.pt")
+                self.save_model(self.best_model)
 
     def train(self):
         self.model.to(self.device)
@@ -102,27 +113,49 @@ class ModelTrainer:
         self.optimise(learning_rate=1e-3, epochs=self.epochs)
         self.optimise(learning_rate=1e-4, epochs=int(self.epochs / 2))
 
-    def save_model(self, path: str):
+    def save_model(self, path: str, best: bool=False):
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(self.model.state_dict(), path)
+        if best and self.best_model != "":
+            os.rename(self.best_model, path)
+        else:
+            torch.save(self.model.state_dict(), path)
 
 
 if __name__ == '__main__':
     import string
-    from datasets.GeneratedCaptchaDataset import GeneratedCaptchaDataset
+    from datasets.NamedFilesDataset import NamedFilesDataset
+    from datasets.LMDBDataset import LMDBDataset
 
-    characters = '-' + string.digits + string.ascii_uppercase
-    width, height, n_len, n_classes = 192, 64, 4, len(characters)
+    characters = string.digits + string.ascii_lowercase
+    width, height, n_len, n_classes = 192, 64, 6, len(characters)
     n_input_length = 12
-    dataset = GeneratedCaptchaDataset(characters=characters, length=1, width=width, height=height,
-                                      input_length=n_input_length,
-                                      label_length=n_len)
-
+    __dataset_basepath = os.path.join(os.path.dirname(__file__), "..", 'data', 'synthetic2')
     batch_size = 128
-    train_set = GeneratedCaptchaDataset(characters, 10 * batch_size, width, height, n_input_length, n_len)
-    valid_set = GeneratedCaptchaDataset(characters, 5 * batch_size, width, height, n_input_length, n_len)
-    train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=os.cpu_count())
-    valid_loader = DataLoader(valid_set, batch_size=batch_size, num_workers=os.cpu_count())
+    train_set = NamedFilesDataset(characters=characters,
+                                  dataset_dirpath=os.path.join(__dataset_basepath, "train"),
+                                  width=width,
+                                  height=height,
+                                  input_length=n_input_length,
+                                  label_length=n_len)
+    valid_set = NamedFilesDataset(characters=characters,
+                                  dataset_dirpath=os.path.join(__dataset_basepath, "valid"),
+                                  width=width,
+                                  height=height,
+                                  input_length=n_input_length,
+                                  label_length=n_len)
+    train_loader = DataLoader(train_set, batch_size=batch_size, num_workers=0)
+    valid_loader = DataLoader(valid_set, batch_size=batch_size, num_workers=0)
+
+    # Create dataset and data loader for LMDB files
+    # __dataset_basepath = os.path.join(os.path.dirname(__file__), '..', 'data', 'synthetic')
+    # train_db_path = os.path.join(__dataset_basepath, "train.lmdb")
+    # valid_db_path = os.path.join(__dataset_basepath, "valid.lmdb")
+    # train_dataset = LMDBDataset(train_db_path)
+    # valid_dataset = LMDBDataset(valid_db_path)
+
+    # batch_size = 128
+    # train_loader = DataLoader(train_dataset, batch_size=batch_size, num_workers=0)
+    # valid_loader = DataLoader(valid_dataset, batch_size=batch_size, num_workers=0)
 
     # start model training
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
@@ -133,9 +166,10 @@ if __name__ == '__main__':
         train_dataloader=train_loader,
         valid_dataloader=valid_loader,
         checkpoint=None,
-        epochs=30
+        checkpoints_dirpath=os.path.join(os.path.dirname(__file__), "..", 'data', 'checkpoints'),
+        epochs=50
     )
     model.train()
 
     model_save_path = os.path.join(os.path.dirname(__file__), "..", 'data', 'models', "captcha.pt")
-    model.save_model(model_save_path)
+    model.save_model(model_save_path, best=True)

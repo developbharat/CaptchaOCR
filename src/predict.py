@@ -46,11 +46,11 @@ class CaptchaPredictor:
 
 
 if __name__ == '__main__':
-    characters = '-' + string.digits + string.ascii_uppercase
+    characters = string.digits + string.ascii_lowercase
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     model = CaptchaPredictor(model_path="data/models/captcha.pt",
                              classes=characters,
-                             input_shape=(192, 64, 3),
+                             input_shape=(200, 80, 3),
                              device=device)
 
     result = model.predict(picture=Image.open("data/sample.png"))

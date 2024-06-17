@@ -1,11 +1,7 @@
 import os
-
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms.functional import to_tensor, to_pil_image
-
-from captcha.image import ImageCaptcha
-import random
 import string
 from PIL import Image
 
@@ -34,7 +30,7 @@ class NamedFilesDataset(Dataset):
     def __getitem__(self, index):
         filename = self.files[index]
         image = to_tensor(Image.open(os.path.join(self.dataset_dirpath, filename)).resize((self.width, self.height)))
-        label = os.path.splitext(filename)[0]
+        label = os.path.splitext(filename)[0].strip()
         target = torch.tensor([self.characters.find(x) for x in label], dtype=torch.long)
         input_length = torch.full(size=(1,), fill_value=self.input_length, dtype=torch.long)
         target_length = torch.full(size=(1,), fill_value=self.label_length, dtype=torch.long)
